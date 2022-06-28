@@ -15,8 +15,8 @@ package worker
 
 import (
 	"k8s.io/apimachinery/pkg/types"
-	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/ipam"
 )
+
 // Operations are the supported operations for on demand resource handler
 type Operations string
 
@@ -52,6 +52,13 @@ type OnDemandJob struct {
 	RequestCount int
 	// NodeName is the k8s node name
 	NodeName string
+}
+
+type ResourceInfo struct {
+	// IPv4 Address
+	ResourceID string
+	// IP prefix origin
+	PrefixOrigin string
 }
 
 // NewOnDemandDeleteJob returns an on demand job for operation Create or Update
@@ -114,7 +121,7 @@ type IPAMJob struct {
 	// Operation is the type of operation on warm pool
 	Operations Operations
 	// Resources can hold the resource to delete or the created resources
-	Resources []ipam.ResourceInfo
+	Resources []ResourceInfo
 	// ResourceCount is the number of resource to be created
 	ResourceCount int
 	// NodeName is the name of the node
@@ -154,7 +161,7 @@ func NewWarmProcessDeleteQueueJob(nodeName string) *WarmPoolJob {
 	}
 }
 
-func NewIPAMDeleteJob(nodeName string, resourcesToDelete []ipam.ResourceInfo) *IPAMJob {
+func NewIPAMDeleteJob(nodeName string, resourcesToDelete []ResourceInfo) *IPAMJob {
 	return &IPAMJob{
 		Operations:    OperationDeleted,
 		NodeName:      nodeName,

@@ -15,11 +15,11 @@ package ipam
 
 import (
 	"fmt"
+	"math"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
-	"math"
-	"strings"
-	"strconv"
 
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/config"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/worker"
@@ -38,11 +38,11 @@ var (
 )
 
 type Ipam interface {
-	AssignResource(requesterID string) (resourceDetail ResourceInfo, shouldReconcile bool, err error)
+	AssignResource(requesterID string) (resourceDetail worker.ResourceInfo, shouldReconcile bool, err error)
 	FreeResource(requesterID string, resourceID string) (shouldReconcile bool, err error)
-	GetAssignedResource(requesterID string) (resourceDetail ResourceInfo, ownsResource bool)
+	GetAssignedResource(requesterID string) (resourceDetail worker.ResourceInfo, ownsResource bool)
 	UpdatePool(job *worker.WarmPoolJob, didSucceed bool) (shouldReconcile bool)
-	ReSync(resources []ResourceInfo)
+	ReSync(resources []worker.ResourceInfo)
 	ReconcilePool() *worker.IPAMJob
 	ProcessCoolDownQueue() bool
 	Introspect() IntrospectResponse
@@ -58,13 +58,13 @@ type ipam struct {
 	// lock to concurrently make modification to the poll resources
 	lock sync.RWMutex // following resources are guarded by the lock
 	// Unused resources prefix mapping [{IP: prefix}, {IP: prefix}...]
-	warmResources []ResourceInfo
+	warmResources []worker.ResourceInfo
 	// Used resources {PodID: {IP Address, Prefix}}
-	usedResources map[string]ResourceInfo
+	usedResources map[string]worker.ResourceInfo
 	// All prefixes that is available through ENI [Prefix1, Prefix2, Prefix3]
 	allocatedPrefix []string
 	// Total IPs across different prefixes {Prefix: # of used addresses}
-	prefixUsage map[string]int	
+	prefixUsage map[string]int
 	// coolDownQueue is the resources that sit in the queue for the cool down period
 	coolDownQueue []CoolDownResource
 	// pendingCreate represents the number of resources being created asynchronously
@@ -78,13 +78,6 @@ type ipam struct {
 	reSyncRequired bool
 }
 
-type ResourceInfo struct {
-	// IPv4 Address
-	resourceID string
-	// IP prefix origin
-	prefixOrigin string
-}
-
 type prefixInfo struct {
 	// Prefix
 	prefix string
@@ -94,20 +87,20 @@ type prefixInfo struct {
 
 type CoolDownResource struct {
 	// ResourceID is the unique ID of the resource
-	ResourceID ResourceInfo
+	ResourceID worker.ResourceInfo
 	// DeletionTimestamp is the time when the owner of the resource was deleted
 	DeletionTimestamp time.Time
 }
 
 // IntrospectResponse is the pool state returned to the introspect API
 type IntrospectResponse struct {
-	UsedResources    map[string]ResourceInfo
-	WarmResources    []ResourceInfo
+	UsedResources    map[string]worker.ResourceInfo
+	WarmResources    []worker.ResourceInfo
 	CoolingResources []CoolDownResource
 }
 
-func NewResourcePool(log logr.Logger, poolConfig *config.WarmPoolConfig, usedResources map[string]ResourceInfo,
-	warmResources []ResourceInfo, allocatedPrefix []string, prefixUsage map[string]int, nodeName string, capacity int) Ipam {
+func NewResourcePool(log logr.Logger, poolConfig *config.WarmPoolConfig, usedResources map[string]worker.ResourceInfo,
+	warmResources []worker.ResourceInfo, allocatedPrefix []string, prefixUsage map[string]int, nodeName string, capacity int) Ipam {
 	ipam := &ipam{
 		log:            log,
 		warmPoolConfig: poolConfig,
@@ -124,7 +117,7 @@ func NewResourcePool(log logr.Logger, poolConfig *config.WarmPoolConfig, usedRes
 // upstream has additional resources which are not present locally, these resources are added
 // to the warm pool. During ReSync all Create/Delete operations on the Pool should be halted
 // but Assign/Free on the Pool can be allowed.
-func (i *ipam) ReSync(upstreamResource []ResourceInfo) {
+func (i *ipam) ReSync(upstreamResource []worker.ResourceInfo) {
 	i.lock.Lock()
 	defer i.lock.Unlock()
 
@@ -137,7 +130,7 @@ func (i *ipam) ReSync(upstreamResource []ResourceInfo) {
 	i.reSyncRequired = false
 
 	// Get the list of local resources
-	var localResources []ResourceInfo
+	var localResources []worker.ResourceInfo
 
 	for _, resource := range i.coolDownQueue {
 		localResources = append(localResources, resource.ResourceID)
@@ -146,7 +139,7 @@ func (i *ipam) ReSync(upstreamResource []ResourceInfo) {
 	for _, v := range i.usedResources {
 		localResources = append(localResources, v)
 	}
-	
+
 	localResources = append(localResources, i.warmResources...)
 
 	// resources that are present upstream but missing in the pool
@@ -190,32 +183,32 @@ func (i *ipam) ReSync(upstreamResource []ResourceInfo) {
 
 // AssignResource assigns a resources to the requester, the caller must retry in case there is capacity and the warm pool
 // is currently empty
-func (i *ipam) AssignResource(requesterID string) (resourceDetail ResourceInfo, shouldReconcile bool, err error) {
+func (i *ipam) AssignResource(requesterID string) (resourceDetail worker.ResourceInfo, shouldReconcile bool, err error) {
 	i.lock.Lock()
 	defer i.lock.Unlock()
 
 	if _, isAlreadyAssigned := i.usedResources[requesterID]; isAlreadyAssigned {
-		return ResourceInfo{}, false, ErrResourceAlreadyAssigned
+		return worker.ResourceInfo{}, false, ErrResourceAlreadyAssigned
 	}
 
 	if len(i.usedResources) == i.capacity {
-		return ResourceInfo{}, false, ErrPoolAtMaxCapacity
+		return worker.ResourceInfo{}, false, ErrPoolAtMaxCapacity
 	}
 
 	// Caller must retry at max by 30 seconds [Max time resource will sit in the cool down queue]
 	if len(i.usedResources)+len(i.coolDownQueue) == i.capacity {
-		return ResourceInfo{}, false, ErrResourceAreBeingCooledDown
+		return worker.ResourceInfo{}, false, ErrResourceAreBeingCooledDown
 	}
 
 	// Caller can retry in 600 ms [Average time to create and attach a new ENI] or less
 	if len(i.usedResources)+len(i.coolDownQueue)+i.pendingCreate+i.pendingDelete == i.capacity {
-		return ResourceInfo{}, false, ErrResourcesAreBeingCreated
+		return worker.ResourceInfo{}, false, ErrResourcesAreBeingCreated
 	}
 
 	// Caller can retry in 600 ms [Average time to create and attach a new ENI] or less
 	// Different from above check because here we want to perform reconciliation
 	if len(i.warmResources) == 0 {
-		return ResourceInfo{}, true, ErrWarmPoolEmpty
+		return worker.ResourceInfo{}, true, ErrWarmPoolEmpty
 	}
 
 	// Allocate the resource
@@ -224,15 +217,15 @@ func (i *ipam) AssignResource(requesterID string) (resourceDetail ResourceInfo, 
 
 	/// Add the resource in the used resource key-value pair
 	i.usedResources[requesterID] = resourceDetail
-	i.prefixUsage[resourceDetail.prefixOrigin]++
+	i.prefixUsage[resourceDetail.PrefixOrigin]++
 
 	i.log.V(1).Info("assigned resource",
-		"resource id", resourceDetail.resourceID, "requester id", requesterID)
+		"resource id", resourceDetail.ResourceID, "requester id", requesterID)
 
 	return resourceDetail, true, nil
 }
 
-func (i *ipam) GetAssignedResource(requesterID string) (resourceDetail ResourceInfo, ownsResource bool) {
+func (i *ipam) GetAssignedResource(requesterID string) (resourceDetail worker.ResourceInfo, ownsResource bool) {
 	i.lock.Lock()
 	defer i.lock.Unlock()
 
@@ -250,7 +243,7 @@ func (i *ipam) FreeResource(requesterID string, resourceID string) (shouldReconc
 		return false, ErrResourceDoesntExist
 	}
 
-	if actualResourceID.resourceID != resourceID {
+	if actualResourceID.ResourceID != resourceID {
 		return false, ErrIncorrectResourceOwner
 	}
 
@@ -288,17 +281,17 @@ func (i *ipam) UpdatePool(job *worker.WarmPoolJob, didSucceed bool) (shouldRecon
 		// Add the resources to the warm pool
 		for _, resource := range job.Resources {
 			availableIPs, error := DeconstructPrefix(resource)
-			
-			if(error != nil) {
+
+			if error != nil {
 				fmt.Println("Error occurred")
 			}
 
-			for j := 0; j< len(availableIPs); j++ {
-				i.warmResources = append(i.warmResources, ResourceInfo{resourceID: availableIPs[j], prefixOrigin: resource})
+			for j := 0; j < len(availableIPs); j++ {
+				i.warmResources = append(i.warmResources, worker.ResourceInfo{ResourceID: availableIPs[j], PrefixOrigin: resource})
 			}
-			
+
 			i.allocatedPrefix = append(i.allocatedPrefix, resource)
-			i.prefixUsage[resource] = 0 
+			i.prefixUsage[resource] = 0
 		}
 		log.Info("added resource to the warm pool", "resources", job.Resources)
 	}
@@ -357,13 +350,13 @@ func (i *ipam) ReconcilePool() *worker.IPAMJob {
 		len(i.usedResources), "pending create", i.pendingCreate, "pending delete", &i.pendingDelete,
 		"cool down queue", len(i.coolDownQueue), "total resources", totalCreatedResources,
 		"max capacity", i.capacity, "desired size", i.warmPoolConfig.DesiredSize)
-	
+
 	// Counts number of free prefixes
 	freePrefixes := make([]string, 0)
 
 	// Count number of unused prefixes
 	for j := 0; j < len(i.allocatedPrefix); j++ {
-		if(i.prefixUsage[i.allocatedPrefix[j]] == 0) {
+		if i.prefixUsage[i.allocatedPrefix[j]] == 0 {
 			freePrefixes = append(freePrefixes, i.allocatedPrefix[j])
 		}
 	}
@@ -417,25 +410,25 @@ func (i *ipam) ReconcilePool() *worker.IPAMJob {
 		deviation = -deviation
 
 		// Amount of unused prefixes to remove
-		prefixesToRemove := int(math.Ceil(float64(deviation/16)))
+		prefixesToRemove := int(math.Ceil(float64(deviation / 16)))
 
-		if(prefixesToRemove > len(freePrefixes)) {
+		if prefixesToRemove > len(freePrefixes) {
 			prefixesToRemove = len(freePrefixes)
 		}
-		
-		var resourceToDelete []ResourceInfo
+
+		var resourceToDelete []worker.ResourceInfo
 		for j := 0; j < prefixesToRemove; j++ {
 			for k := 0; k < len(i.warmResources); k++ {
-				if(i.warmResources[k].prefixOrigin == freePrefixes[j]) {
+				if i.warmResources[k].PrefixOrigin == freePrefixes[j] {
 					resourceToDelete = append(resourceToDelete, i.warmResources[k])
 				}
 			}
 		}
-	
-		var newWarmResources []ResourceInfo
+
+		var newWarmResources []worker.ResourceInfo
 		k := 0
-		for j := 0; j< len(i.warmResources); j++ {
-			if(i.warmResources[j].resourceID != resourceToDelete[k].resourceID) {
+		for j := 0; j < len(i.warmResources); j++ {
+			if i.warmResources[j].ResourceID != resourceToDelete[k].ResourceID {
 				newWarmResources = append(newWarmResources, i.warmResources[j])
 			} else {
 				k++
@@ -460,7 +453,7 @@ func (i *ipam) Introspect() IntrospectResponse {
 	i.lock.RLock()
 	defer i.lock.RUnlock()
 
-	usedResources := make(map[string]ResourceInfo)
+	usedResources := make(map[string]worker.ResourceInfo)
 	for k, v := range i.usedResources {
 		usedResources[k] = v
 	}
@@ -473,14 +466,14 @@ func (i *ipam) Introspect() IntrospectResponse {
 }
 
 // Difference returns a-b, elements present in a and not in b
-func Difference(a, b []ResourceInfo) (diff []ResourceInfo) {
+func Difference(a, b []worker.ResourceInfo) (diff []worker.ResourceInfo) {
 	m := make(map[string]struct{})
 
 	for _, item := range b {
-		m[item.resourceID] = struct{}{}
+		m[item.ResourceID] = struct{}{}
 	}
 	for _, item := range a {
-		if _, ok := m[item.resourceID]; !ok {
+		if _, ok := m[item.ResourceID]; !ok {
 			diff = append(diff, item)
 		}
 	}
@@ -491,13 +484,13 @@ func Difference(a, b []ResourceInfo) (diff []ResourceInfo) {
 func DeconstructPrefix(inputPrefix string) (warmResourceBundle []string, err error) {
 	// Remove masking #
 	var segmentedIP = strings.Split(inputPrefix, "/")
-	
+
 	var ipAddress = strings.Split(segmentedIP[0], ".")
 
 	// Increment host number
-	var hostNumber,error = strconv.Atoi(ipAddress[3])
+	var hostNumber, error = strconv.Atoi(ipAddress[3])
 
-	if(error != nil) {
+	if error != nil {
 		fmt.Print("Unproperly parsed host number")
 	}
 
@@ -509,4 +502,3 @@ func DeconstructPrefix(inputPrefix string) (warmResourceBundle []string, err err
 	}
 	return availableIPs, nil
 }
-

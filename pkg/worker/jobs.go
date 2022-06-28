@@ -13,8 +13,10 @@
 
 package worker
 
-import "k8s.io/apimachinery/pkg/types"
-
+import (
+	"k8s.io/apimachinery/pkg/types"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/ipam"
+)
 // Operations are the supported operations for on demand resource handler
 type Operations string
 
@@ -107,6 +109,18 @@ type WarmPoolJob struct {
 	NodeName string
 }
 
+// WarmPoolJob represents the job for a resource handler for warm pool resources
+type IPAMJob struct {
+	// Operation is the type of operation on warm pool
+	Operations Operations
+	// Resources can hold the resource to delete or the created resources
+	Resources []ipam.ResourceInfo
+	// ResourceCount is the number of resource to be created
+	ResourceCount int
+	// NodeName is the name of the node
+	NodeName string
+}
+
 // NewWarmPoolCreateJob returns a job on warm pool of resource
 func NewWarmPoolCreateJob(nodeName string, count int) *WarmPoolJob {
 	return &WarmPoolJob{
@@ -136,6 +150,32 @@ func NewWarmPoolDeleteJob(nodeName string, resourcesToDelete []string) *WarmPool
 func NewWarmProcessDeleteQueueJob(nodeName string) *WarmPoolJob {
 	return &WarmPoolJob{
 		Operations: OperationProcessDeleteQueue,
+		NodeName:   nodeName,
+	}
+}
+
+func NewIPAMDeleteJob(nodeName string, resourcesToDelete []ipam.ResourceInfo) *IPAMJob {
+	return &IPAMJob{
+		Operations:    OperationDeleted,
+		NodeName:      nodeName,
+		Resources:     resourcesToDelete,
+		ResourceCount: len(resourcesToDelete),
+	}
+}
+
+// NewWarmPoolCreateJob returns a job on warm pool of resource
+func NewIPAMCreateJob(nodeName string, count int) *IPAMJob {
+	return &IPAMJob{
+		Operations:    OperationCreate,
+		NodeName:      nodeName,
+		ResourceCount: count,
+	}
+}
+
+// NewWarmPoolReSyncJob returns a job to re-sync the warm pool with upstream
+func NewIPAMReSyncJob(nodeName string) *IPAMJob {
+	return &IPAMJob{
+		Operations: OperationReSyncPool,
 		NodeName:   nodeName,
 	}
 }

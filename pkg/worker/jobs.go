@@ -107,6 +107,26 @@ type WarmPoolJob struct {
 	NodeName string
 }
 
+// IPAM represents the job for a resource handler for IPAM resources
+type IPAMJob struct {
+	// Operation is the type of operation on IPAM
+	Operations Operations
+	// Resources can hold the resource to delete or the created resources
+	Resources []string
+	// ResourceCount is the number of resource to be created
+	ResourceCount int
+	// NodeName is the name of the node
+	NodeName string
+}
+
+// Resource Info for IPAM
+type IPAMResourceInfo struct {
+	// IPv4 Address
+	ResourceID string
+	// IP prefix origin
+	PrefixOrigin string
+}
+
 // NewWarmPoolCreateJob returns a job on warm pool of resource
 func NewWarmPoolCreateJob(nodeName string, count int) *WarmPoolJob {
 	return &WarmPoolJob{
